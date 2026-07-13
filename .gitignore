@@ -1,0 +1,33 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Xcode
+DerivedData/
+build/
+*.xcuserstate
+*.xcscmblueprint
+xcuserdata/
+*.moved-aside
+*.xccheckout
+
+# Swift Package Manager
+.build/
+.swiftpm/
+Package.resolved
+
+# Editors
+.idea/
+.vscode/
+*~
+*.swp
+
+# Local environment and logs
+.env
+.env.*
+*.log
+
+# Extracted binary artifact (the zip is the tracked package input)
+LibXray.xcframework/
+__MACOSX/

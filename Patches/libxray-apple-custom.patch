@@ -1,0 +1,12 @@
+diff --git a/xray/xray.go b/xray/xray.go
+index ddae126..469cd89 100644
+--- a/xray/xray.go
++++ b/xray/xray.go
+@@ -52,6 +52,7 @@ func StartXrayFromJSON(configJSON string) (*core.Instance, error) {
+ // SetTunFd sets the TUN file descriptor.
+ // Call this BEFORE RunXray/RunXrayFromJSON.
+ func SetTunFd(fd int32) {
++	tun.SetTunFd(int(fd))
+ 	os.Setenv(platform.TunFdKey, strconv.Itoa(int(fd)))
+ }
+ 

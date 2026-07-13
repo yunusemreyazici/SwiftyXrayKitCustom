@@ -1,0 +1,193 @@
+diff --git a/app/router/condition_geoip.go b/app/router/condition_geoip.go
+index cdfcb9f..6a1d6a2 100644
+--- a/app/router/condition_geoip.go
++++ b/app/router/condition_geoip.go
+@@ -803,6 +803,13 @@ type GeoIPSetFactory struct {
+ 
+ var ipsetFactory = GeoIPSetFactory{shared: make(map[string]*GeoIPSet)}
+ 
++// ClearGeoIPCache releases matcher data retained across embedded core restarts.
++func ClearGeoIPCache() {
++	ipsetFactory.Lock()
++	ipsetFactory.shared = make(map[string]*GeoIPSet)
++	ipsetFactory.Unlock()
++}
++
+ func (f *GeoIPSetFactory) GetOrCreate(key string, cidrGroups [][]*CIDR) (*GeoIPSet, error) {
+ 	f.Lock()
+ 	defer f.Unlock()
+diff --git a/infra/conf/transport_internet.go b/infra/conf/transport_internet.go
+index 849f0e3..67c6d19 100644
+--- a/infra/conf/transport_internet.go
++++ b/infra/conf/transport_internet.go
+@@ -12,7 +12,6 @@ import (
+ 	"strconv"
+ 	"strings"
+ 	"syscall"
+-	"time"
+ 
+ 	"github.com/xtls/xray-core/common/errors"
+ 	"github.com/xtls/xray-core/common/net"
+@@ -707,12 +706,8 @@ func (c *TLSConfig) Build() (proto.Message, error) {
+ 	config.MasterKeyLog = c.MasterKeyLog
+ 
+ 	if c.AllowInsecure {
+-		if time.Now().After(time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)) {
+-			return nil, errors.PrintRemovedFeatureError(`"allowInsecure"`, `"pinnedPeerCertSha256"`)
+-		} else {
+-			errors.LogWarning(context.Background(), `"allowInsecure" will be removed automatically after 2026-06-01, please use "pinnedPeerCertSha256"(pcs) and "verifyPeerCertByName"(vcn) instead, PLEASE CONTACT YOUR SERVICE PROVIDER (AIRPORT)`)
+-			config.AllowInsecure = true
+-		}
++		errors.LogWarning(context.Background(), `"allowInsecure" is enabled by this custom client build; TLS peer certificates will not be verified`)
++		config.AllowInsecure = true
+ 	}
+ 	if c.PinnedPeerCertSha256 != "" {
+ 		for v := range strings.SplitSeq(c.PinnedPeerCertSha256, ",") {
+diff --git a/proxy/tun/tun_darwin.go b/proxy/tun/tun_darwin.go
+index ad9f478..27c98fe 100644
+--- a/proxy/tun/tun_darwin.go
++++ b/proxy/tun/tun_darwin.go
+@@ -9,6 +9,7 @@ import (
+ 	"net/netip"
+ 	"os"
+ 	"strconv"
++	"sync/atomic"
+ 	"syscall"
+ 	"unsafe"
+ 
+@@ -47,7 +48,31 @@ var _ Tun = (*DarwinTun)(nil)
+ var _ GVisorTun = (*DarwinTun)(nil)
+ var _ GVisorDevice = (*DarwinTun)(nil)
+ 
++// embeddedTunFd stores fd + 1 so the zero value means "not provided".
++// iOS embedders use this direct path because process environment propagation
++// is not reliable enough during Network Extension startup.
++var embeddedTunFd atomic.Int64
++
++// SetTunFd supplies the Network Extension-owned packet fd to the next TUN
++// instance. The fd remains owned by the embedding application.
++func SetTunFd(fd int) {
++	embeddedTunFd.Store(int64(fd) + 1)
++}
++
+ func NewTun(options TunOptions) (Tun, error) {
++	if encodedFd := embeddedTunFd.Load(); encodedFd > 0 {
++		fd := int(encodedFd - 1)
++		if err := unix.SetNonblock(fd, true); err != nil {
++			return nil, err
++		}
++
++		return &DarwinTun{
++			tunFile: os.NewFile(uintptr(fd), "utun"),
++			options: options,
++			ownsFd:  false,
++		}, nil
++	}
++
+ 	// Check if fd is provided via environment (iOS mode)
+ 	fdStr := platform.NewEnvFlag(platform.TunFdKey).GetValue(func() string { return "" })
+ 	if fdStr != "" {
+diff --git a/proxy/tun/stack_gvisor.go b/proxy/tun/stack_gvisor.go
+index ab767c6..9535fcb 100644
+--- a/proxy/tun/stack_gvisor.go
++++ b/proxy/tun/stack_gvisor.go
+@@ -24,13 +24,39 @@ const (
+ 
+ 	tcpRXBufMinSize = tcp.MinBufferSize
+ 	tcpRXBufDefSize = tcp.DefaultSendBufferSize
+-	tcpRXBufMaxSize = 8 << 20 // 8MiB
+ 
+ 	tcpTXBufMinSize = tcp.MinBufferSize
+ 	tcpTXBufDefSize = tcp.DefaultReceiveBufferSize
+-	tcpTXBufMaxSize = 6 << 20 // 6MiB
+ )
+ 
++var (
++	tcpBufMaxSize  = 8 << 20 // 8MiB
++	tcpMaxInFlight = 65535
++	maxUDPConns    = 4096
++)
++
++// SetTCPBufMaxKB configures the maximum gVisor TCP receive/send buffer.
++// Mobile wrappers call this before the TUN stack is started.
++func SetTCPBufMaxKB(kb int) {
++	if kb > 0 {
++		tcpBufMaxSize = kb << 10
++	}
++}
++
++// SetTCPMaxInFlight configures the gVisor TCP forwarder connection limit.
++func SetTCPMaxInFlight(n int) {
++	if n > 0 {
++		tcpMaxInFlight = n
++	}
++}
++
++// SetMaxUDPConns configures the maximum number of active full-cone UDP sessions.
++func SetMaxUDPConns(n int) {
++	if n > 0 {
++		maxUDPConns = n
++	}
++}
++
+ // stackGVisor is ip stack implemented by gVisor package
+ type stackGVisor struct {
+ 	ctx         context.Context
+@@ -70,7 +96,7 @@ func (t *stackGVisor) Start() error {
+ 		return err
+ 	}
+ 
+-	tcpForwarder := tcp.NewForwarder(ipStack, 0, 65535, func(r *tcp.ForwarderRequest) {
++	tcpForwarder := tcp.NewForwarder(ipStack, 0, tcpMaxInFlight, func(r *tcp.ForwarderRequest) {
+ 		go func(r *tcp.ForwarderRequest) {
+ 			var wq waiter.Queue
+ 			var id = r.ID()
+@@ -243,7 +269,7 @@ func createStack(ep stack.LinkEndpoint) (*stack.Stack, error) {
+ 	tcpRXBufOpt := tcpip.TCPReceiveBufferSizeRangeOption{
+ 		Min:     tcpRXBufMinSize,
+ 		Default: tcpRXBufDefSize,
+-		Max:     tcpRXBufMaxSize,
++		Max:     tcpBufMaxSize,
+ 	}
+ 	err = gStack.SetTransportProtocolOption(tcp.ProtocolNumber, &tcpRXBufOpt)
+ 	if err != nil {
+@@ -253,7 +279,7 @@ func createStack(ep stack.LinkEndpoint) (*stack.Stack, error) {
+ 	tcpTXBufOpt := tcpip.TCPSendBufferSizeRangeOption{
+ 		Min:     tcpTXBufMinSize,
+ 		Default: tcpTXBufDefSize,
+-		Max:     tcpTXBufMaxSize,
++		Max:     tcpBufMaxSize,
+ 	}
+ 	err = gStack.SetTransportProtocolOption(tcp.ProtocolNumber, &tcpTXBufOpt)
+ 	if err != nil {
+diff --git a/proxy/tun/udp_fullcone.go b/proxy/tun/udp_fullcone.go
+index df58ce4..313e3c3 100644
+--- a/proxy/tun/udp_fullcone.go
++++ b/proxy/tun/udp_fullcone.go
+@@ -34,6 +34,10 @@ func (u *udpConnectionHandler) HandlePacket(src net.Destination, dst net.Destina
+ 	u.Lock()
+ 	conn, found := u.udpConns[src]
+ 	if !found {
++		if len(u.udpConns) >= maxUDPConns {
++			u.Unlock()
++			return false
++		}
+ 		egress := make(chan []byte, 16)
+ 		conn = &udpConn{handler: u, egress: egress, src: src, dst: dst}
+ 		u.udpConns[src] = conn
+diff --git a/transport/internet/tls/config.go b/transport/internet/tls/config.go
+index 9a41f37..c4e6e43 100644
+--- a/transport/internet/tls/config.go
++++ b/transport/internet/tls/config.go
+@@ -23,6 +23,11 @@ import (
+ 
+ var globalSessionCache = tls.NewLRUClientSessionCache(128)
+ 
++// ResetSessionCache releases TLS sessions retained across embedded core restarts.
++func ResetSessionCache() {
++	globalSessionCache = tls.NewLRUClientSessionCache(128)
++}
++
+ // ParseCertificate converts a cert.Certificate to Certificate.
+ func ParseCertificate(c *cert.Certificate) *Certificate {
+ 	if c != nil {
